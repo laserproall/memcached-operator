@@ -14,13 +14,14 @@ limitations under the License.
 package controllers
 
 import (
+	"encoding/json"
 	"reflect"
 	"time"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 
 	"context"
@@ -73,19 +74,52 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	// Check if the deployment already exists, if not create a new one
-	found := &appsv1.Deployment{}
-	err = r.Get(ctx, types.NamespacedName{Name: memcached.Name, Namespace: memcached.Namespace}, found)
+	// Check if the chaosblade already exists, if not create a new one
+	found := &unstructured.Unstructured{}
+	found.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "chaosblade.io",
+		Kind:    "ChaosBlade",
+		Version: "v1alpha1",
+	})
+	err = r.Get(ctx, types.NamespacedName{Name: memcached.Name}, found)
 	if err != nil && errors.IsNotFound(err) {
-		// Define a new deployment
-		dep := r.deploymentForMemcached(memcached)
-		log.Info("Creating a new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
-		err = r.Create(ctx, dep)
+		// Define a new chaosblade
+		cb := r.chaosbladeForMemcached(memcached)
+		log.Info("Creating a new Chaosblade", "Chaosblade.Name", memcached.Name)
+		err = r.Create(ctx, cb)
 		if err != nil {
-			log.Error(err, "Failed to create new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+			log.Error(err, "Failed to create new Chaosblade", "Chaosblade.Name", memcached.Name)
 			return ctrl.Result{}, err
 		}
-		// Deployment created successfully - return and requeue
+		// Update the Memcached status with the chaoblade status
+		time.Sleep(5 * time.Second)
+
+		_ = r.Get(ctx, types.NamespacedName{Name: memcached.Name}, cb)
+		cbStatus, _, _ := unstructured.NestedMap(cb.Object, "status")
+		cbstatusData, err := json.Marshal(cbStatus)
+		if err != nil {
+			log.Error(err, "Failed to Marshal.")
+			return ctrl.Result{}, err
+		}
+
+		tmpmStatus := &cachev1alpha1.MemcachedStatus{}
+		err = json.Unmarshal(cbstatusData, tmpmStatus)
+		if err != nil {
+			log.Error(err, "Failed to Unmarshal.")
+			return ctrl.Result{}, err
+		}
+
+		// Update status.Nodes if needed
+		if !reflect.DeepEqual(tmpmStatus, memcached.Status) {
+			memcached.Status = *tmpmStatus
+			err := r.Status().Update(ctx, memcached)
+			if err != nil {
+				log.Error(err, "Failed to update Memcached status")
+				return ctrl.Result{}, err
+			}
+		}
+
+		// Chaosblade created successfully - return and requeue
 		return ctrl.Result{Requeue: true}, nil
 	} else if err != nil {
 		log.Error(err, "Failed to get Deployment")
@@ -93,121 +127,171 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// Ensure the deployment size is the same as the spec
-	size := memcached.Spec.Size
-	if *found.Spec.Replicas != size {
-		found.Spec.Replicas = &size
-		err = r.Update(ctx, found)
-		if err != nil {
-			log.Error(err, "Failed to update Deployment", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
-			return ctrl.Result{}, err
-		}
-		// Ask to requeue after 1 minute in order to give enough time for the
-		// pods be created on the cluster side and the operand be able
-		// to do the next update step accurately.
-		return ctrl.Result{RequeueAfter: time.Minute}, nil
-	}
+	// size := memcached.Spec.Size
+	// if *found.Spec.Replicas != size {
+	// 	found.Spec.Replicas = &size
+	// 	err = r.Update(ctx, found)
+	// 	if err != nil {
+	// 		log.Error(err, "Failed to update Deployment", "Deployment.Namespace", found.Namespace, "Deployment.Name", found.Name)
+	// 		return ctrl.Result{}, err
+	// 	}
+	// 	// Ask to requeue after 1 minute in order to give enough time for the
+	// 	// pods be created on the cluster side and the operand be able
+	// 	// to do the next update step accurately.
+	// 	return ctrl.Result{RequeueAfter: time.Minute}, nil
+	// }
 
 	// Update the Memcached status with the pod names
 	// List the pods for this memcached's deployment
-	podList := &corev1.PodList{}
-	listOpts := []client.ListOption{
-		client.InNamespace(memcached.Namespace),
-		client.MatchingLabels(labelsForMemcached(memcached.Name)),
-	}
-	if err = r.List(ctx, podList, listOpts...); err != nil {
-		log.Error(err, "Failed to list pods", "Memcached.Namespace", memcached.Namespace, "Memcached.Name", memcached.Name)
-		return ctrl.Result{}, err
-	}
-	podNames := getPodNames(podList.Items)
+	// 	podList := &corev1.PodList{}
+	// 	listOpts := []client.ListOption{
+	// 		client.InNamespace(memcached.Namespace),
+	// 		client.MatchingLabels(labelsForMemcached(memcached.Name)),
+	// 	}
+	// 	if err = r.List(ctx, podList, listOpts...); err != nil {
+	// 		log.Error(err, "Failed to list pods", "Memcached.Namespace", memcached.Namespace, "Memcached.Name", memcached.Name)
+	// 		return ctrl.Result{}, err
+	// 	}
+	// 	podNames := getPodNames(podList.Items)
 
-	// Update status.Nodes if needed
-	if !reflect.DeepEqual(podNames, memcached.Status.Nodes) {
-		memcached.Status.Nodes = podNames
-		err := r.Status().Update(ctx, memcached)
-		if err != nil {
-			log.Error(err, "Failed to update Memcached status")
-			return ctrl.Result{}, err
-		}
-	}
+	// // Update status.Nodes if needed
+	// if !reflect.DeepEqual(podNames, memcached.Status.Nodes) {
+	// 	memcached.Status.Nodes = podNames
+	// 	err := r.Status().Update(ctx, memcached)
+	// 	if err != nil {
+	// 		log.Error(err, "Failed to update Memcached status")
+	// 		return ctrl.Result{}, err
+	// 	}
+	// }
 
 	return ctrl.Result{}, nil
 }
 
-// deploymentForMemcached returns a memcached Deployment object
-func (r *MemcachedReconciler) deploymentForMemcached(m *cachev1alpha1.Memcached) *appsv1.Deployment {
-	ls := labelsForMemcached(m.Name)
-	replicas := m.Spec.Size
-
-	dep := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      m.Name,
-			Namespace: m.Namespace,
-		},
-		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas,
-			Selector: &metav1.LabelSelector{
-				MatchLabels: ls,
+// chaosbladeForMemcached returns a memcached Chaosblade object
+func (r *MemcachedReconciler) chaosbladeForMemcached(m *cachev1alpha1.Memcached) *unstructured.Unstructured {
+	// ls := labelsForMemcached(m.Name)
+	// replicas := m.Spec.Size
+	cb := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"name": m.Name,
 			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: ls,
-				},
-				Spec: corev1.PodSpec{
-					// Ensure restrictive standard for the Pod.
-					// More info: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
-					SecurityContext: &corev1.PodSecurityContext{
-						// WARNING: Ensure that the image used defines an UserID in the Dockerfile
-						// otherwise the Pod will not run and will fail with "container has runAsNonRoot and image has non-numeric user"".
-						// If you want your workloads admitted in namespaces enforced with the restricted mode in OpenShift/OKD vendors
-						// then, you MUST ensure that the Dockerfile defines a User ID OR you MUST leave the "RunAsNonRoot" and
-						// "RunAsUser" fields empty.
-						RunAsNonRoot: &[]bool{true}[0],
-						// Please ensure that you can use SeccompProfile and do NOT use
-						// this field if your project must work on old Kubernetes
-						// versions < 1.19 or on vendors versions which
-						// do NOT support this field by default (i.e. Openshift < 4.11)
-						SeccompProfile: &corev1.SeccompProfile{
-							Type: corev1.SeccompProfileTypeRuntimeDefault,
-						},
-					},
-					Containers: []corev1.Container{{
-						Image: "memcached:1.4.36-alpine",
-						Name:  "memcached",
-						// Ensure restrictive context for the container
-						// More info: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
-						SecurityContext: &corev1.SecurityContext{
-							// WARNING: Ensure that the image used defines an UserID in the Dockerfile
-							// otherwise the Pod will not run and will fail with "container has runAsNonRoot and image has non-numeric user"".
-							// If you want your workloads admitted in namespaces enforced with the restricted mode in OpenShift/OKD vendors
-							// then, you MUST ensure that the Dockerfile defines a User ID OR you MUST leave the "RunAsNonRoot" and
-							// "RunAsUser" fields empty.
-							RunAsNonRoot:             &[]bool{true}[0],
-							AllowPrivilegeEscalation: &[]bool{false}[0],
-							Capabilities: &corev1.Capabilities{
-								Drop: []corev1.Capability{
-									"ALL",
-								},
-							},
-							// The memcached image does not use a non-zero numeric user as the default user.
-							// Due to RunAsNonRoot field being set to true, we need to force the user in the
-							// container to a non-zero numeric user. We do this using the RunAsUser field.
-							// However, if you are looking to provide solution for K8s vendors like OpenShift
-							// be aware that you can not run under its restricted-v2 SCC if you set this value.
-							RunAsUser: &[]int64{1000}[0],
-						},
-						Command: []string{"memcached", "-m=64", "-o", "modern", "-v"},
-						Ports: []corev1.ContainerPort{{
-							ContainerPort: 11211,
-							Name:          "memcached",
-						}},
-					}},
-				},
-			},
+			"spec": m.Spec,
 		},
 	}
+	cb.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "chaosblade.io",
+		Kind:    "ChaosBlade",
+		Version: "v1alpha1",
+	})
+
+	// cb := &unstructured.Unstructured{
+	// 	Object: map[string]interface{}{
+	// 		"metadata": map[string]interface{}{
+	// 			"name": m.Name,
+	// 		},
+	// 		"spec": map[string]interface{}{
+	// 			"experiments": []map[string]interface{}{
+	// 				{
+	// 					"scope":  "node",
+	// 					"target": "cpu",
+	// 					"action": "fullload",
+	// 					"matchers": []map[string]interface{}{
+	// 						{
+	// 							"name": "names",
+	// 							"value": []string{
+	// 								"k8s-node1",
+	// 							},
+	// 						},
+	// 						{
+	// 							"name": "cpu-percent",
+	// 							"value": []string{
+	// 								"10",
+	// 							},
+	// 						},
+	// 					},
+	// 				},
+	// 			},
+	// 		},
+	// 	},
+	// }
+
+	// cb.SetGroupVersionKind(schema.GroupVersionKind{
+	// 	Group:   "chaosblade.io",
+	// 	Kind:    "ChaosBlade",
+	// 	Version: "v1alpha1",
+	// })
+
+	// dep := &appsv1.Deployment{
+	// 	ObjectMeta: metav1.ObjectMeta{
+	// 		Name:      m.Name,
+	// 		Namespace: m.Namespace,
+	// 	},
+	// 	Spec: appsv1.DeploymentSpec{
+	// 		Replicas: &replicas,
+	// 		Selector: &metav1.LabelSelector{
+	// 			MatchLabels: ls,
+	// 		},
+	// 		Template: corev1.PodTemplateSpec{
+	// 			ObjectMeta: metav1.ObjectMeta{
+	// 				Labels: ls,
+	// 			},
+	// 			Spec: corev1.PodSpec{
+	// 				// Ensure restrictive standard for the Pod.
+	// 				// More info: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
+	// 				SecurityContext: &corev1.PodSecurityContext{
+	// 					// WARNING: Ensure that the image used defines an UserID in the Dockerfile
+	// 					// otherwise the Pod will not run and will fail with "container has runAsNonRoot and image has non-numeric user"".
+	// 					// If you want your workloads admitted in namespaces enforced with the restricted mode in OpenShift/OKD vendors
+	// 					// then, you MUST ensure that the Dockerfile defines a User ID OR you MUST leave the "RunAsNonRoot" and
+	// 					// "RunAsUser" fields empty.
+	// 					RunAsNonRoot: &[]bool{true}[0],
+	// 					// Please ensure that you can use SeccompProfile and do NOT use
+	// 					// this field if your project must work on old Kubernetes
+	// 					// versions < 1.19 or on vendors versions which
+	// 					// do NOT support this field by default (i.e. Openshift < 4.11)
+	// 					SeccompProfile: &corev1.SeccompProfile{
+	// 						Type: corev1.SeccompProfileTypeRuntimeDefault,
+	// 					},
+	// 				},
+	// 				Containers: []corev1.Container{{
+	// 					Image: "memcached:1.4.36-alpine",
+	// 					Name:  "memcached",
+	// 					// Ensure restrictive context for the container
+	// 					// More info: https://kubernetes.io/docs/concepts/security/pod-security-standards/#restricted
+	// 					SecurityContext: &corev1.SecurityContext{
+	// 						// WARNING: Ensure that the image used defines an UserID in the Dockerfile
+	// 						// otherwise the Pod will not run and will fail with "container has runAsNonRoot and image has non-numeric user"".
+	// 						// If you want your workloads admitted in namespaces enforced with the restricted mode in OpenShift/OKD vendors
+	// 						// then, you MUST ensure that the Dockerfile defines a User ID OR you MUST leave the "RunAsNonRoot" and
+	// 						// "RunAsUser" fields empty.
+	// 						RunAsNonRoot:             &[]bool{true}[0],
+	// 						AllowPrivilegeEscalation: &[]bool{false}[0],
+	// 						Capabilities: &corev1.Capabilities{
+	// 							Drop: []corev1.Capability{
+	// 								"ALL",
+	// 							},
+	// 						},
+	// 						// The memcached image does not use a non-zero numeric user as the default user.
+	// 						// Due to RunAsNonRoot field being set to true, we need to force the user in the
+	// 						// container to a non-zero numeric user. We do this using the RunAsUser field.
+	// 						// However, if you are looking to provide solution for K8s vendors like OpenShift
+	// 						// be aware that you can not run under its restricted-v2 SCC if you set this value.
+	// 						RunAsUser: &[]int64{1000}[0],
+	// 					},
+	// 					Command: []string{"memcached", "-m=64", "-o", "modern", "-v"},
+	// 					Ports: []corev1.ContainerPort{{
+	// 						ContainerPort: 11211,
+	// 						Name:          "memcached",
+	// 					}},
+	// 				}},
+	// 			},
+	// 		},
+	// 	},
+	// }
 	// Set Memcached instance as the owner and controller
-	ctrl.SetControllerReference(m, dep, r.Scheme)
-	return dep
+	// ctrl.SetControllerReference(m, dep, r.Scheme)
+	return cb
 }
 
 // labelsForMemcached returns the labels for selecting the resources
@@ -229,6 +313,6 @@ func getPodNames(pods []corev1.Pod) []string {
 func (r *MemcachedReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cachev1alpha1.Memcached{}).
-		Owns(&appsv1.Deployment{}).
+		// Owns(&appsv1.Deployment{}).
 		Complete(r)
 }

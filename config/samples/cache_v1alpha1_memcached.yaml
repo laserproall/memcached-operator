@@ -4,4 +4,15 @@ metadata:
   name: memcached-sample
 spec:
   # TODO(user): Add fields here
-  size: 1
+  experiments:
+  - scope: node
+    target: cpu
+    action: fullload
+    desc: "increase node cpu load by names"
+    matchers:
+    - name: names
+      value:
+      - "k8s-node1"
+    - name: cpu-percent
+      value:
+      - "10"
